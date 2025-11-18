@@ -18,6 +18,7 @@ env:
   DIY_SCRIPT: diy-script.sh
   UPLOAD_FIRMWARE: true
   UPLOAD_RELEASE: true
+  PACKAGED_OUTPUTPATH: ${{ github.workspace }}/output
   TZ: Asia/Shanghai
 
 jobs:
@@ -61,40 +62,49 @@ jobs:
       run: |
         cd $OPENWRT_PATH
         
-        # 创建 OneCloud 配置文件
+        # 创建 OneCloud 精简版配置文件
         cat > .config <<EOF
         CONFIG_TARGET_amlogic=y
         CONFIG_TARGET_amlogic_meson8b=y
         CONFIG_TARGET_amlogic_meson8b_DEVICE_thunder-onecloud=y
         
-        # 基础系统
+        # 基础系统（精简版）
         CONFIG_PACKAGE_luci=y
         CONFIG_PACKAGE_luci-ssl-openssl=y
         CONFIG_LUCI_LANG_zh_Hans=y
         
-        # 常用插件
+        # 核心功能（只保留必要的）
         CONFIG_PACKAGE_luci-app-opkg=y
         CONFIG_PACKAGE_luci-app-firewall=y
         CONFIG_PACKAGE_luci-app-ttyd=y
-        CONFIG_PACKAGE_luci-app-upnp=y
-        CONFIG_PACKAGE_luci-app-samba4=y
-        CONFIG_PACKAGE_luci-app-aria2=y
         
-        # 代理相关（根据需要启用）
+        # 可选功能（按需启用）
+        # CONFIG_PACKAGE_luci-app-upnp=y
+        # CONFIG_PACKAGE_luci-app-samba4=y
+        # CONFIG_PACKAGE_luci-app-ddns=y
+        
+        # 代理工具（按需选择一个）
         # CONFIG_PACKAGE_luci-app-passwall=y
-        # CONFIG_PACKAGE_luci-app-ssr-plus=y
         # CONFIG_PACKAGE_luci-app-openclash=y
         
-        # 镜像格式
+        # 镜像格式（使用 squashfs 更省空间）
         CONFIG_TARGET_ROOTFS_SQUASHFS=y
         CONFIG_TARGET_SQUASHFS_BLOCK_SIZE=256
+        CONFIG_TARGET_KERNEL_PARTSIZE=32
+        CONFIG_TARGET_ROOTFS_PARTSIZE=512
         
-        # 内核模块
+        # 基础内核模块
         CONFIG_PACKAGE_kmod-usb-core=y
         CONFIG_PACKAGE_kmod-usb-storage=y
-        CONFIG_PACKAGE_kmod-usb-storage-extras=y
         CONFIG_PACKAGE_kmod-fs-ext4=y
-        CONFIG_PACKAGE_kmod-fs-vfat=y
+        
+        # 禁用不必要的功能
+        # CONFIG_PACKAGE_luci-app-dockerman is not set
+        # CONFIG_PACKAGE_luci-app-qbittorrent is not set
+        # CONFIG_PACKAGE_luci-app-transmission is not set
+        # CONFIG_PACKAGE_luci-app-aria2 is not set
+        # CONFIG_PACKAGE_luci-app-zerotier is not set
+        # CONFIG_PACKAGE_luci-app-netdata is not set
         
         EOF
         
@@ -120,14 +130,25 @@ jobs:
       if: (!cancelled())
       run: df -hT
 
-    - name: 整理固件文件
-      id: organize
-      if: env.UPLOAD_FIRMWARE == 'true' && !cancelled()
+    - name: 打包 OneCloud 固件
+      uses: ophub/amlogic-s9xxx-openwrt@main
+      if: steps.organize.outputs.status == 'success' && !cancelled()
+      with:
+        openwrt_path: $OPENWRT_PATH/bin/targets/*/*
+        openwrt_board: s805
+        openwrt_kernel: 5.15.1_6.1.1
+        auto_kernel: true
+        kernel_repo: ophub/kernel
+        openwrt_size: 960
+        gh_token: ${{ secrets.GITHUB_TOKEN }}
+    
+    - name: 整理打包后的固件
+      id: packagefirm
       run: |
-        cd $OPENWRT_PATH/bin/targets/*/*
-        rm -rf packages
+        cd ${{ env.PACKAGED_OUTPUTPATH }}
         echo "FIRMWARE_PATH=$PWD" >> $GITHUB_ENV
         echo "status=success" >> $GITHUB_OUTPUT
+        ls -lh
 
     - name: 上传固件到 Artifacts
       uses: actions/upload-artifact@v4
