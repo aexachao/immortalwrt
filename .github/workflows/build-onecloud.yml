@@ -52,11 +52,11 @@ jobs:
         cd $OPENWRT_PATH
         
         cat > .config <<EOF
-        # 目标平台：ARMv8（玩客云是 Amlogic S805，32位 ARMv8）
+        # 目标平台：ARMv7（玩客云 S805 基于 ARMv8 架构但仅支持 32 位模式）
         CONFIG_TARGET_armsr=y
-        CONFIG_TARGET_armsr_armv8=y
+        CONFIG_TARGET_armsr_armv7=y
         CONFIG_TARGET_MULTI_PROFILE=y
-        CONFIG_TARGET_DEVICE_armsr_armv8_DEVICE_generic=y
+        CONFIG_TARGET_DEVICE_armsr_armv7_DEVICE_generic=y
         
         # 生成 rootfs.tar.gz（必须！）
         CONFIG_TARGET_ROOTFS_TARGZ=y
