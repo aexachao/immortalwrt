@@ -1,4 +1,4 @@
-name: Build ImmortalWrt for OneCloud S805
+name: Build ImmortalWrt for OneCloud (Kwrt Style)
 
 on:
   workflow_dispatch:
@@ -28,8 +28,8 @@ jobs:
         sudo -E apt-get -qq update
         sudo -E apt-get -qq install -y build-essential clang flex bison g++ gawk \
           gcc-multilib g++-multilib gettext git libncurses5-dev libssl-dev \
-          python3 python3-dev python3-setuptools python3-pip \
-          rsync unzip zlib1g-dev file wget libelf-dev cmake
+          python3 python3-dev python3-setuptools rsync unzip zlib1g-dev file wget \
+          libelf-dev cmake gzip bzip2 patch perl-base
         sudo timedatectl set-timezone "$TZ"
 
     - name: 克隆源代码
@@ -44,43 +44,38 @@ jobs:
         ./scripts/feeds update -a
         ./scripts/feeds install -a
 
-    - name: 加载 OneCloud S805 配置
+    - name: 加载 ARMv7 通用配置（用于生成 rootfs）
       run: |
         cd $OPENWRT_PATH
         
-        # 创建精简的 OneCloud 配置
+        # 使用通用 ARMv7 目标编译 rootfs
         cat > .config <<EOF
-        # Target 设置（尝试使用 ARMv7 通用目标）
+        # 通用 ARMv7 目标
         CONFIG_TARGET_armsr=y
         CONFIG_TARGET_armsr_armv7=y
         CONFIG_TARGET_MULTI_PROFILE=y
         CONFIG_TARGET_DEVICE_armsr_armv7_DEVICE_generic=y
         
-        # 基础系统
+        # 生成 rootfs.tar.gz（重要！）
+        CONFIG_TARGET_ROOTFS_TARGZ=y
+        CONFIG_TARGET_ROOTFS_EXT4FS=y
+        CONFIG_TARGET_KERNEL_PARTSIZE=32
+        CONFIG_TARGET_ROOTFS_PARTSIZE=800
+        
+        # 基础系统（精简）
         CONFIG_PACKAGE_luci=y
         CONFIG_PACKAGE_luci-ssl=y
         CONFIG_LUCI_LANG_zh_Hans=y
         
-        # 核心功能（精简版）
+        # 核心应用
         CONFIG_PACKAGE_luci-app-opkg=y
         CONFIG_PACKAGE_luci-app-firewall=y
         CONFIG_PACKAGE_luci-app-ttyd=y
         
-        # 禁用 Python 相关包（避免依赖问题）
+        # 禁用 Python（避免依赖问题）
         # CONFIG_PACKAGE_python3 is not set
-        # CONFIG_PACKAGE_python3-base is not set
         
-        # 可选插件（按需启用）
-        # CONFIG_PACKAGE_luci-app-samba4=y
-        # CONFIG_PACKAGE_luci-app-ddns=y
-        # CONFIG_PACKAGE_luci-app-upnp=y
-        
-        # 镜像格式（生成 tar.gz 用于后续打包）
-        CONFIG_TARGET_ROOTFS_SQUASHFS=y
-        CONFIG_TARGET_ROOTFS_TARGZ=y
-        CONFIG_TARGET_ROOTFS_EXT4FS=y
-        
-        # 内核模块
+        # USB 支持
         CONFIG_PACKAGE_kmod-usb-core=y
         CONFIG_PACKAGE_kmod-usb-storage=y
         CONFIG_PACKAGE_kmod-fs-ext4=y
@@ -89,82 +84,119 @@ jobs:
         EOF
         
         make defconfig
-        
-        # 显示最终配置
-        echo "===== 最终配置预览 ====="
-        grep "^CONFIG_TARGET" .config | head -20
 
     - name: 下载编译依赖
       run: |
         cd $OPENWRT_PATH
-        echo "开始下载依赖包..."
         make download -j16
-        # 检查是否有下载失败的包
-        find dl -size -1024c -exec ls -l {} \;
-        find dl -size -1024c -exec rm -f {} \;
 
     - name: 编译固件
       id: compile
       run: |
         cd $OPENWRT_PATH
-        echo "开始编译（使用 $(nproc) 线程）..."
-        echo "编译开始时间: $(date)"
-        
-        # 先尝试多线程编译
-        make -j$(nproc) V=s 2>&1 | tee build.log || {
-          echo "多线程编译失败，切换到单线程模式..."
-          make -j1 V=s 2>&1 | tee -a build.log
-        }
-        
-        echo "编译结束时间: $(date)"
+        echo "开始编译（$(nproc) 线程）..."
+        make -j$(nproc) V=s 2>&1 | tee build.log || make -j1 V=s
         echo "status=success" >> $GITHUB_OUTPUT
         echo "FILE_DATE=$(date +"%Y%m%d%H%M")" >> $GITHUB_ENV
-    
-    - name: 检查编译结果
+
+    - name: 下载 OneCloud 打包工具
       if: steps.compile.outputs.status == 'success'
       run: |
         cd $OPENWRT_PATH
-        echo "===== 编译输出文件 ====="
-        ls -lh bin/targets/*/* 2>/dev/null || echo "未找到编译输出"
+        # 使用 unifreq 的打包脚本（支持 S805）
+        git clone --depth 1 https://github.com/unifreq/openwrt_packit package/openwrt_packit
         
-        # 检查是否有错误
-        if grep -i "error" build.log | grep -v "WARNING" | tail -20; then
-          echo "发现编译错误，请查看完整日志"
-        fi
+        # 或使用 shiyu1314 的脚本
+        # git clone --depth 1 https://github.com/shiyu1314/OneCloud-OpenWrt-Build package/onecloud_build
 
-    - name: 整理固件文件
-      id: organize
+    - name: 打包 OneCloud 固件
+      id: package
       if: steps.compile.outputs.status == 'success'
       run: |
-        cd $OPENWRT_PATH/bin/targets/*/*
-        rm -rf packages
-        echo "FIRMWARE_PATH=$PWD" >> $GITHUB_ENV
+        cd $OPENWRT_PATH
+        
+        # 查找 rootfs.tar.gz
+        ROOTFS_FILE=$(find bin/targets -name "*rootfs.tar.gz" | head -n 1)
+        echo "找到 rootfs: $ROOTFS_FILE"
+        
+        if [ -z "$ROOTFS_FILE" ]; then
+          echo "错误：未找到 rootfs.tar.gz"
+          exit 1
+        fi
+        
+        # 复制到打包目录
+        mkdir -p package/openwrt_packit/tmp
+        cp $ROOTFS_FILE package/openwrt_packit/tmp/
+        
+        # 进入打包目录
+        cd package/openwrt_packit
+        
+        # 使用打包脚本（根据实际脚本名称调整）
+        # 如果有 mk_s805_mxqpro+.sh 或类似脚本
+        if [ -f "mk_s805_mxqpro+.sh" ]; then
+          sudo bash mk_s805_mxqpro+.sh
+        elif [ -f "make.sh" ]; then
+          sudo bash make.sh -d
+        else
+          echo "警告：未找到打包脚本，尝试手动打包..."
+          # 这里需要根据实际的打包脚本调整
+        fi
+        
+        # 整理固件
+        mkdir -p $OPENWRT_PATH/output
+        find . -name "*.img" -o -name "*.img.gz" | xargs -i cp {} $OPENWRT_PATH/output/ || true
+        
+        echo "FIRMWARE_PATH=$OPENWRT_PATH/output" >> $GITHUB_ENV
         echo "status=success" >> $GITHUB_OUTPUT
-        ls -lh
+        
+        # 显示打包结果
+        echo "===== 打包完成的固件 ====="
+        ls -lh $OPENWRT_PATH/output/
 
-    - name: 上传固件到 Artifacts
+    - name: 上传原始 rootfs（备用）
       uses: actions/upload-artifact@v4
-      if: steps.organize.outputs.status == 'success'
+      if: steps.compile.outputs.status == 'success'
       with:
-        name: ImmortalWrt_OneCloud_${{ env.FILE_DATE }}
+        name: ImmortalWrt_OneCloud_Rootfs_${{ env.FILE_DATE }}
+        path: ${{ env.OPENWRT_PATH }}/bin/targets/*/*/*.tar.gz
+
+    - name: 上传打包固件
+      uses: actions/upload-artifact@v4
+      if: steps.package.outputs.status == 'success'
+      with:
+        name: ImmortalWrt_OneCloud_Firmware_${{ env.FILE_DATE }}
         path: ${{ env.FIRMWARE_PATH }}
 
-    - name: 生成 Release Tag
+    - name: 生成 Release
       id: tag
-      if: env.UPLOAD_RELEASE == 'true'
+      if: env.UPLOAD_RELEASE == 'true' && steps.package.outputs.status == 'success'
       run: |
         echo "release_tag=$(date +"%Y.%m.%d-%H%M")" >> $GITHUB_OUTPUT
-        touch release.txt
-        echo "## ImmortalWrt OneCloud S805 固件" >> release.txt
-        echo "### 编译时间" >> release.txt
-        echo "🕐 $(date +"%Y年%m月%d日 %H:%M:%S")" >> release.txt
-        echo "### 使用说明" >> release.txt
-        echo "1. 下载 rootfs.tar.gz 文件" >> release.txt
-        echo "2. 使用打包工具生成 OneCloud 可刷写镜像" >> release.txt
-        echo "3. 或直接SSH升级替换根文件系统" >> release.txt
+        cat > release.txt <<EOF
+        ## ImmortalWrt OneCloud (S805) 固件
+        
+        ### 编译信息
+        - 编译时间: $(date +"%Y年%m月%d日 %H:%M:%S")
+        - 目标设备: OneCloud (Amlogic S805)
+        - 内核版本: ARMv7 通用
+        
+        ### 刷机方法
+        1. 下载 .img 或 .img.gz 文件
+        2. 解压（如果是 .gz）
+        3. SSH 到 OneCloud 执行:
+           \`\`\`
+           dd if=/tmp/固件.img of=/dev/mmcblk0 bs=4M conv=fsync
+           reboot
+           \`\`\`
+        
+        ### 默认设置
+        - IP: 192.168.1.1 或 DHCP
+        - 用户名: root
+        - 密码: password 或无密码
+        EOF
         echo "status=success" >> $GITHUB_OUTPUT
 
-    - name: 上传固件到 Release
+    - name: 上传到 Release
       uses: softprops/action-gh-release@v2
       if: steps.tag.outputs.status == 'success'
       env:
@@ -172,4 +204,13 @@ jobs:
       with:
         tag_name: ${{ steps.tag.outputs.release_tag }}
         body_path: release.txt
-        files: ${{ env.FIRMWARE_PATH }}/*
+        files: |
+          ${{ env.FIRMWARE_PATH }}/*
+          ${{ env.OPENWRT_PATH }}/bin/targets/*/*/*.tar.gz
+
+    - name: 上传编译日志（如果失败）
+      uses: actions/upload-artifact@v4
+      if: failure()
+      with:
+        name: Build_Log_${{ env.FILE_DATE }}
+        path: ${{ env.OPENWRT_PATH }}/build.log
