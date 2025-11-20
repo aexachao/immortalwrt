@@ -52,17 +52,30 @@ jobs:
         cd $OPENWRT_PATH
         
         cat > .config <<EOF
-        # 通用 ARMv7 目标
+        # 目标平台：ARMv8（玩客云是 Amlogic S805，32位 ARMv8）
         CONFIG_TARGET_armsr=y
-        CONFIG_TARGET_armsr_armv7=y
+        CONFIG_TARGET_armsr_armv8=y
         CONFIG_TARGET_MULTI_PROFILE=y
-        CONFIG_TARGET_DEVICE_armsr_armv7_DEVICE_generic=y
+        CONFIG_TARGET_DEVICE_armsr_armv8_DEVICE_generic=y
         
         # 生成 rootfs.tar.gz（必须！）
         CONFIG_TARGET_ROOTFS_TARGZ=y
         CONFIG_TARGET_ROOTFS_PARTSIZE=960
         
-        # 基础系统（精简版）
+        # 文件系统支持
+        CONFIG_TARGET_ROOTFS_EXT4FS=y
+        CONFIG_TARGET_EXT4_JOURNAL=y
+        
+        # 内核模块
+        CONFIG_PACKAGE_kmod-usb-core=y
+        CONFIG_PACKAGE_kmod-usb-storage=y
+        CONFIG_PACKAGE_kmod-usb-storage-extras=y
+        CONFIG_PACKAGE_kmod-usb-storage-uas=y
+        CONFIG_PACKAGE_kmod-fs-ext4=y
+        CONFIG_PACKAGE_kmod-fs-vfat=y
+        CONFIG_PACKAGE_kmod-fs-ntfs3=y
+        
+        # 基础系统
         CONFIG_PACKAGE_luci=y
         CONFIG_PACKAGE_luci-ssl-openssl=y
         CONFIG_LUCI_LANG_zh_Hans=y
@@ -73,22 +86,16 @@ jobs:
         CONFIG_PACKAGE_luci-app-firewall=y
         CONFIG_PACKAGE_luci-app-ttyd=y
         
-        # 可选应用（根据需要启用）
-        # CONFIG_PACKAGE_luci-app-samba4=y
-        # CONFIG_PACKAGE_luci-app-ddns=y
-        # CONFIG_PACKAGE_luci-app-upnp=y
-        # CONFIG_PACKAGE_luci-app-passwall=y
-        
-        # USB 支持
-        CONFIG_PACKAGE_kmod-usb-core=y
-        CONFIG_PACKAGE_kmod-usb-storage=y
-        CONFIG_PACKAGE_kmod-usb-storage-extras=y
-        CONFIG_PACKAGE_kmod-fs-ext4=y
-        CONFIG_PACKAGE_kmod-fs-vfat=y
-        
         # 网络工具
         CONFIG_PACKAGE_wget-ssl=y
         CONFIG_PACKAGE_curl=y
+        CONFIG_PACKAGE_ethtool=y
+        
+        # 系统工具
+        CONFIG_PACKAGE_htop=y
+        CONFIG_PACKAGE_bash=y
+        CONFIG_PACKAGE_tar=y
+        CONFIG_PACKAGE_gzip=y
         
         EOF
         
@@ -113,20 +120,32 @@ jobs:
         make -j$(nproc) V=s 2>&1 | tee build.log || make -j1 V=s 2>&1 | tee -a build.log
         
         echo "编译结束: $(date)"
-        echo "status=success" >> $GITHUB_OUTPUT
-        echo "FILE_DATE=$(date +"%Y%m%d%H%M")" >> $GITHUB_ENV
+        
+        # 检查是否编译成功
+        if [ -f "bin/targets/armsr/armv8/immortalwrt-armsr-armv8-generic-rootfs.tar.gz" ]; then
+          echo "status=success" >> $GITHUB_OUTPUT
+          echo "FILE_DATE=$(date +"%Y%m%d%H%M")" >> $GITHUB_ENV
+        else
+          echo "status=failed" >> $GITHUB_OUTPUT
+          echo "编译失败：未找到 rootfs.tar.gz"
+          exit 1
+        fi
 
     - name: 检查编译产物
       if: steps.compile.outputs.status == 'success'
       run: |
         cd $OPENWRT_PATH
         echo "===== 编译产物 ====="
-        find bin/targets -name "*rootfs.tar.gz" -ls
+        find bin/targets -type f -ls
+        
         ROOTFS=$(find bin/targets -name "*rootfs.tar.gz" | head -n 1)
         if [ -z "$ROOTFS" ]; then
           echo "错误：未找到 rootfs.tar.gz"
           exit 1
         fi
+        
+        echo "找到 rootfs: $ROOTFS"
+        ls -lh "$ROOTFS"
         echo "ROOTFS_PATH=$ROOTFS" >> $GITHUB_ENV
 
     - name: 准备打包环境
@@ -150,9 +169,16 @@ jobs:
       run: |
         cd $PACK_DIR/onecloud-u-boot
         
-        # 解压 rootfs 到指定位置
+        # 创建 openwrt 目录并解压 rootfs
+        echo "解压 rootfs..."
         mkdir -p openwrt
-        tar -xzf *rootfs.tar.gz -C openwrt/
+        ROOTFS_FILE=$(ls *rootfs.tar.gz | head -n 1)
+        echo "解压文件: $ROOTFS_FILE"
+        tar -xzf "$ROOTFS_FILE" -C openwrt/
+        
+        # 检查解压结果
+        echo "===== 解压后的内容 ====="
+        ls -lh openwrt/ | head -20
         
         # 拉取 soulteary 的打包工具镜像
         echo "拉取 Docker 打包工具..."
@@ -160,11 +186,14 @@ jobs:
         
         # 使用 Docker 进行打包
         echo "开始打包 OneCloud 固件..."
-        sudo docker run -v $(pwd):/uboot soulteary/onecloud-uboot:packer-2025.01.06
+        sudo docker run --rm -v $(pwd):/uboot soulteary/onecloud-uboot:packer-2025.01.06
         
         # 检查打包结果
+        echo "===== 打包结果 ====="
+        ls -lh build/ || true
+        
         if [ -f "build/eMMC.burn.img" ]; then
-          echo "打包成功！"
+          echo "✅ 打包成功！"
           
           # 重命名和压缩固件
           mkdir -p $GITHUB_WORKSPACE/output
@@ -172,18 +201,25 @@ jobs:
           cp build/eMMC.burn.img $GITHUB_WORKSPACE/output/$FIRMWARE_NAME
           
           cd $GITHUB_WORKSPACE/output
+          
+          # 生成 SHA256 校验
+          sha256sum $FIRMWARE_NAME > $FIRMWARE_NAME.sha256
+          
+          # 压缩固件
           gzip -k $FIRMWARE_NAME
+          
+          echo "===== 最终固件 ====="
+          ls -lh
           
           echo "FIRMWARE_PATH=$GITHUB_WORKSPACE/output" >> $GITHUB_ENV
           echo "FIRMWARE_NAME=$FIRMWARE_NAME" >> $GITHUB_ENV
           echo "status=success" >> $GITHUB_OUTPUT
         else
-          echo "打包失败：未生成镜像文件"
+          echo "❌ 打包失败：未生成镜像文件"
+          echo "Docker 运行日志："
+          sudo docker logs $(sudo docker ps -lq) || true
           exit 1
         fi
-        
-        echo "===== 最终固件 ====="
-        ls -lh $GITHUB_WORKSPACE/output/
 
     - name: 上传 rootfs（备份）
       uses: actions/upload-artifact@v4
@@ -197,7 +233,7 @@ jobs:
       if: steps.package.outputs.status == 'success'
       with:
         name: ImmortalWrt_OneCloud_Firmware_${{ env.FILE_DATE }}
-        path: ${{ env.FIRMWARE_PATH }}
+        path: ${{ env.FIRMWARE_PATH }}/*
 
     - name: 生成 Release 说明
       id: tag
@@ -212,7 +248,7 @@ jobs:
         - **构建时间**: $(date +"%Y年%m月%d日 %H:%M:%S")
         - **目标设备**: 玩客云 OneCloud (Amlogic S805)
         - **系统版本**: ImmortalWrt $REPO_BRANCH
-        - **U-Boot**: soulteary/onecloud-u-boot (2025.01.06)
+        - **U-Boot**: soulteary/onecloud-uboot (2025.01.06)
         - **固件类型**: 完整刷机包（.img）
         
         ### ✨ 固件特性
@@ -257,7 +293,7 @@ jobs:
         1. 拆开 OneCloud 外壳，找到主板
         2. 找到短接点（不同版本位置可能不同，请搜索"玩客云短接点"）
         3. USB 线连接 OneCloud（靠近 HDMI 的 USB 口）和电脑
-        4. 打开 USB Burning Tool，导入下载的 \`.img\` 文件
+        4. 打开 USB Burning Tool，导入下载的 \`.img\` 文件（解压后）
         5. 用镊子短接触点，然后插电，看到"已连接"后松开
         6. 点击"开始"按钮，等待刷写完成（约 5-6 分钟）
         7. 刷写成功后断电，装回外壳
@@ -269,8 +305,8 @@ jobs:
            - 插电启动，等待 2-3 分钟
         
         2. **查找 IP 地址**
-           - 方法 1：登录路由器后台，查看名为 "onecloud" 的设备
-           - 方法 2：默认可能是 \`192.168.1.1\`
+           - 方法 1：登录路由器后台，查看名为 "ImmortalWrt" 的设备
+           - 方法 2：使用 IP 扫描工具扫描局域网
         
         3. **登录管理界面**
            - 浏览器访问：\`http://你的IP地址\`
@@ -278,7 +314,7 @@ jobs:
            - 默认密码：\`password\` 或无密码
         
         4. **首次配置**
-           - 修改管理密码
+           - 修改管理密码（重要！）
            - 配置网络（WAN/LAN）
            - 根据需要安装额外软件包
         
@@ -286,6 +322,7 @@ jobs:
         
         - **${{ env.FIRMWARE_NAME }}.gz** - 压缩的固件镜像（推荐下载，体积小）
         - **${{ env.FIRMWARE_NAME }}** - 未压缩的固件镜像
+        - **${{ env.FIRMWARE_NAME }}.sha256** - SHA256 校验文件
         - **rootfs.tar.gz** - 根文件系统（供高级用户自行打包使用）
         
         ### ⚠️ 重要提醒
@@ -294,6 +331,7 @@ jobs:
         - 首次启动可能需要 2-3 分钟，请耐心等待
         - 如遇问题，可尝试重新刷机或使用 USB 线刷方式
         - 建议首次登录后立即修改密码
+        - 下载后请验证 SHA256 校验值
         
         ### 🔧 故障排查
         
@@ -301,21 +339,23 @@ jobs:
         - 检查网线连接
         - 查看路由器 DHCP 列表确认 IP
         - 等待足够的启动时间（2-3分钟）
-        - 尝试访问 192.168.1.1
+        - 检查设备指示灯状态
         
         **刷机失败？**
         - 确认使用 USB Burning Tool v2.1.6.8
         - 检查短接是否到位
         - 更换 USB 线或电脑 USB 口
         - 确保下载的固件完整（检查 SHA256）
+        - 尝试使用解压后的 .img 文件
         
         ### 💡 进阶使用
         
-        **磁盘扩容（如需使用全部 eMMC 空间）：**
+        **磁盘扩容（使用全部 eMMC 空间）：**
         \`\`\`bash
         ssh root@你的IP
         /usr/sbin/parted /dev/mmcblk0 resizepart 2 100%
         resize2fs /dev/mmcblk0p2
+        df -h  # 查看扩容结果
         \`\`\`
         
         **挂载 USB 存储：**
@@ -323,9 +363,12 @@ jobs:
         # 查看设备
         fdisk -l
         
-        # 挂载
+        # 挂载（假设是 /dev/sda1）
         mkdir -p /mnt/usb
         mount /dev/sda1 /mnt/usb
+        
+        # 开机自动挂载（编辑 /etc/fstab）
+        echo "/dev/sda1 /mnt/usb ext4 defaults 0 0" >> /etc/fstab
         \`\`\`
         
         ### 📞 反馈与支持
@@ -349,7 +392,6 @@ jobs:
         body_path: release.txt
         files: |
           ${{ env.FIRMWARE_PATH }}/*
-          ${{ env.ROOTFS_PATH }}
 
     - name: 清理旧的 Releases
       uses: dev-drprasad/delete-older-releases@v0.3.4
@@ -366,5 +408,6 @@ jobs:
       with:
         name: Build_Logs_${{ env.FILE_DATE }}
         path: |
-          ${{ env.OPENWRT_PATH }}/build.log
-          ${{ env.OPENWRT_PATH }}/.config
+          openwrt/build.log
+          openwrt/.config
+        if-no-files-found: warn
