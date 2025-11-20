@@ -20,19 +20,29 @@ jobs:
     - name: 检出代码
       uses: actions/checkout@v4
 
+    - name: 释放磁盘空间
+      run: |
+        echo "释放磁盘空间前："
+        df -h
+        sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+        sudo docker image prune --all --force
+        echo "释放磁盘空间后："
+        df -h
+
     - name: 初始化编译环境
       env:
         DEBIAN_FRONTEND: noninteractive
       run: |
-        sudo rm -rf /etc/apt/sources.list.d/* /usr/share/dotnet /usr/local/lib/android /opt/ghc
-        sudo -E apt-get -qq update
-        sudo -E apt-get -qq install -y ack antlr3 asciidoc autoconf automake autopoint binutils bison build-essential \
+        sudo rm -rf /etc/apt/sources.list.d/*
+        sudo apt-get update
+        sudo apt-get install -y ack antlr3 asciidoc autoconf automake autopoint binutils bison build-essential \
           bzip2 ccache cmake cpio curl device-tree-compiler fastjar flex gawk gettext gcc-multilib g++-multilib \
           git gperf haveged help2man intltool libc6-dev-i386 libelf-dev libfuse-dev libglib2.0-dev libgmp3-dev \
           libltdl-dev libmpc-dev libmpfr-dev libncurses5-dev libncursesw5-dev libpython3-dev libreadline-dev \
           libssl-dev libtool lrzsz mkisofs msmtp ninja-build p7zip p7zip-full patch pkgconf python3 python3-pyelftools \
           python3-setuptools qemu-utils rsync scons squashfs-tools subversion swig texinfo uglifyjs upx-ucl unzip \
-          vim wget xmlto xxd zlib1g-dev dosfstools mtools parted docker.io
+          vim wget xmlto xxd zlib1g-dev
+        sudo apt-get install -y dosfstools mtools parted
         sudo timedatectl set-timezone "$TZ"
 
     - name: 克隆 ImmortalWrt 源码
@@ -110,6 +120,18 @@ jobs:
         make download -j16
         find dl -size -1024c -exec rm -f {} \;
 
+    - name: 验证配置（调试用）
+      run: |
+        cd $OPENWRT_PATH
+        echo "===== 检查目标平台 ====="
+        ls -la target/linux/ | grep armsr || echo "未找到 armsr 目标"
+        
+        echo "===== 当前配置 ====="
+        grep "^CONFIG_TARGET" .config
+        
+        echo "===== 可用架构 ====="
+        find target/linux -maxdepth 1 -type d | sort
+
     - name: 编译 ImmortalWrt
       id: compile
       run: |
@@ -122,7 +144,7 @@ jobs:
         echo "编译结束: $(date)"
         
         # 检查是否编译成功
-        if [ -f "bin/targets/armsr/armv8/immortalwrt-armsr-armv8-generic-rootfs.tar.gz" ]; then
+        if [ -f "bin/targets/armsr/armv7/immortalwrt-armsr-armv7-generic-rootfs.tar.gz" ]; then
           echo "status=success" >> $GITHUB_OUTPUT
           echo "FILE_DATE=$(date +"%Y%m%d%H%M")" >> $GITHUB_ENV
         else
@@ -406,8 +428,8 @@ jobs:
       uses: actions/upload-artifact@v4
       if: failure()
       with:
-        name: Build_Logs_${{ env.FILE_DATE }}
+        name: Build_Logs_${{ env.FILE_DATE || 'failed' }}
         path: |
-          openwrt/build.log
-          openwrt/.config
-        if-no-files-found: warn
+          ${{ github.workspace }}/openwrt/build.log
+          ${{ github.workspace }}/openwrt/.config
+        if-no-files-found: ignore
