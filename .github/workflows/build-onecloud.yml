@@ -1,4 +1,4 @@
-name: Build ImmortalWrt for OneCloud (Full Package)
+name: Build ImmortalWrt for OneCloud (Production Ready)
 
 on:
   workflow_dispatch:
@@ -32,7 +32,7 @@ jobs:
           libltdl-dev libmpc-dev libmpfr-dev libncurses5-dev libncursesw5-dev libpython3-dev libreadline-dev \
           libssl-dev libtool lrzsz mkisofs msmtp ninja-build p7zip p7zip-full patch pkgconf python3 python3-pyelftools \
           python3-setuptools qemu-utils rsync scons squashfs-tools subversion swig texinfo uglifyjs upx-ucl unzip \
-          vim wget xmlto xxd zlib1g-dev dosfstools mtools parted
+          vim wget xmlto xxd zlib1g-dev dosfstools mtools parted docker.io
         sudo timedatectl set-timezone "$TZ"
 
     - name: 克隆 ImmortalWrt 源码
@@ -47,21 +47,22 @@ jobs:
         ./scripts/feeds update -a
         ./scripts/feeds install -a
 
-    - name: 加载配置（ARMv7 通用）
+    - name: 加载自定义配置
       run: |
         cd $OPENWRT_PATH
         
         cat > .config <<EOF
+        # 通用 ARMv7 目标
         CONFIG_TARGET_armsr=y
         CONFIG_TARGET_armsr_armv7=y
         CONFIG_TARGET_MULTI_PROFILE=y
         CONFIG_TARGET_DEVICE_armsr_armv7_DEVICE_generic=y
         
-        # 生成 rootfs.tar.gz（关键！）
+        # 生成 rootfs.tar.gz（必须！）
         CONFIG_TARGET_ROOTFS_TARGZ=y
         CONFIG_TARGET_ROOTFS_PARTSIZE=960
         
-        # 基础系统
+        # 基础系统（精简版）
         CONFIG_PACKAGE_luci=y
         CONFIG_PACKAGE_luci-ssl-openssl=y
         CONFIG_LUCI_LANG_zh_Hans=y
@@ -72,7 +73,13 @@ jobs:
         CONFIG_PACKAGE_luci-app-firewall=y
         CONFIG_PACKAGE_luci-app-ttyd=y
         
-        # USB 和文件系统支持
+        # 可选应用（根据需要启用）
+        # CONFIG_PACKAGE_luci-app-samba4=y
+        # CONFIG_PACKAGE_luci-app-ddns=y
+        # CONFIG_PACKAGE_luci-app-upnp=y
+        # CONFIG_PACKAGE_luci-app-passwall=y
+        
+        # USB 支持
         CONFIG_PACKAGE_kmod-usb-core=y
         CONFIG_PACKAGE_kmod-usb-storage=y
         CONFIG_PACKAGE_kmod-usb-storage-extras=y
@@ -83,139 +90,107 @@ jobs:
         CONFIG_PACKAGE_wget-ssl=y
         CONFIG_PACKAGE_curl=y
         
-        # 根据需要添加其他插件
-        # CONFIG_PACKAGE_luci-app-samba4=y
-        # CONFIG_PACKAGE_luci-app-ddns=y
-        
         EOF
         
         make defconfig
+        
+        echo "===== 配置预览 ====="
+        grep "^CONFIG_TARGET" .config | head -10
 
     - name: 下载依赖包
       run: |
         cd $OPENWRT_PATH
         make download -j16
+        find dl -size -1024c -exec rm -f {} \;
 
-    - name: 编译固件
+    - name: 编译 ImmortalWrt
       id: compile
       run: |
         cd $OPENWRT_PATH
-        echo "开始编译 ImmortalWrt..."
-        make -j$(nproc) V=s || make -j1 V=s
+        echo "开始编译（$(nproc) 线程）..."
+        echo "编译开始: $(date)"
+        
+        make -j$(nproc) V=s 2>&1 | tee build.log || make -j1 V=s 2>&1 | tee -a build.log
+        
+        echo "编译结束: $(date)"
         echo "status=success" >> $GITHUB_OUTPUT
         echo "FILE_DATE=$(date +"%Y%m%d%H%M")" >> $GITHUB_ENV
+
+    - name: 检查编译产物
+      if: steps.compile.outputs.status == 'success'
+      run: |
+        cd $OPENWRT_PATH
+        echo "===== 编译产物 ====="
+        find bin/targets -name "*rootfs.tar.gz" -ls
+        ROOTFS=$(find bin/targets -name "*rootfs.tar.gz" | head -n 1)
+        if [ -z "$ROOTFS" ]; then
+          echo "错误：未找到 rootfs.tar.gz"
+          exit 1
+        fi
+        echo "ROOTFS_PATH=$ROOTFS" >> $GITHUB_ENV
 
     - name: 准备打包环境
       if: steps.compile.outputs.status == 'success'
       run: |
-        # 创建打包目录
-        mkdir -p $GITHUB_WORKSPACE/package_workspace
-        cd $GITHUB_WORKSPACE/package_workspace
+        mkdir -p $GITHUB_WORKSPACE/package
+        cd $GITHUB_WORKSPACE/package
         
-        # 克隆 OneCloud u-boot 项目
+        # 克隆 soulteary 的 u-boot 项目
+        echo "下载 OneCloud u-boot 工具..."
         git clone --depth 1 https://github.com/soulteary/onecloud-u-boot.git
         
-        # 克隆打包脚本（使用社区常用的工具）
-        git clone --depth 1 https://github.com/hzyitc/u-boot-onecloud.git pack-tools
+        # 复制 rootfs 到打包目录
+        cp $ROOTFS_PATH onecloud-u-boot/
         
-        echo "PACK_WORKSPACE=$GITHUB_WORKSPACE/package_workspace" >> $GITHUB_ENV
+        echo "PACK_DIR=$GITHUB_WORKSPACE/package" >> $GITHUB_ENV
 
-    - name: 打包 OneCloud 固件
-      id: package
+    - name: 使用 Docker 打包 OneCloud 固件
       if: steps.compile.outputs.status == 'success'
+      id: package
       run: |
-        cd $PACK_WORKSPACE
+        cd $PACK_DIR/onecloud-u-boot
         
-        # 查找 rootfs
-        ROOTFS_FILE=$(find $OPENWRT_PATH/bin/targets -name "*rootfs.tar.gz" | head -n 1)
+        # 解压 rootfs 到指定位置
+        mkdir -p openwrt
+        tar -xzf *rootfs.tar.gz -C openwrt/
         
-        if [ -z "$ROOTFS_FILE" ]; then
-          echo "错误：未找到 rootfs.tar.gz"
+        # 拉取 soulteary 的打包工具镜像
+        echo "拉取 Docker 打包工具..."
+        sudo docker pull soulteary/onecloud-uboot:packer-2025.01.06
+        
+        # 使用 Docker 进行打包
+        echo "开始打包 OneCloud 固件..."
+        sudo docker run -v $(pwd):/uboot soulteary/onecloud-uboot:packer-2025.01.06
+        
+        # 检查打包结果
+        if [ -f "build/eMMC.burn.img" ]; then
+          echo "打包成功！"
+          
+          # 重命名和压缩固件
+          mkdir -p $GITHUB_WORKSPACE/output
+          FIRMWARE_NAME="ImmortalWrt-OneCloud-$(date +%Y%m%d).img"
+          cp build/eMMC.burn.img $GITHUB_WORKSPACE/output/$FIRMWARE_NAME
+          
+          cd $GITHUB_WORKSPACE/output
+          gzip -k $FIRMWARE_NAME
+          
+          echo "FIRMWARE_PATH=$GITHUB_WORKSPACE/output" >> $GITHUB_ENV
+          echo "FIRMWARE_NAME=$FIRMWARE_NAME" >> $GITHUB_ENV
+          echo "status=success" >> $GITHUB_OUTPUT
+        else
+          echo "打包失败：未生成镜像文件"
           exit 1
         fi
         
-        echo "找到 rootfs: $ROOTFS_FILE"
-        
-        # 创建打包目录结构
-        mkdir -p output
-        mkdir -p build
-        
-        # 复制 rootfs
-        cp $ROOTFS_FILE build/rootfs.tar.gz
-        
-        # 使用 u-boot 打包工具（需要根据实际工具调整）
-        # 如果有现成的打包脚本
-        if [ -f "pack-tools/make_img.sh" ]; then
-          cd pack-tools
-          sudo bash make_img.sh ../build/rootfs.tar.gz
-          cp *.img ../output/ || true
-        else
-          # 手动打包流程
-          cd $PACK_WORKSPACE
-          
-          # 下载 OneCloud u-boot
-          if [ ! -f "onecloud-u-boot/pack/bootloader.img" ]; then
-            echo "u-boot 文件不存在，尝试使用预编译版本..."
-            # 这里可以添加从 release 下载预编译 u-boot 的逻辑
-          fi
-          
-          # 创建镜像
-          echo "创建 OneCloud 镜像..."
-          
-          # 基本的镜像创建流程（简化版）
-          IMG_SIZE=1024  # 1GB
-          IMG_NAME="immortalwrt-onecloud-$(date +%Y%m%d).img"
-          
-          # 创建空镜像
-          dd if=/dev/zero of=output/$IMG_NAME bs=1M count=$IMG_SIZE
-          
-          # 创建分区表
-          parted -s output/$IMG_NAME mklabel msdos
-          parted -s output/$IMG_NAME mkpart primary ext4 17M 100%
-          
-          # 挂载并写入 rootfs
-          LOOP_DEV=$(sudo losetup -f --show output/$IMG_NAME)
-          sudo partprobe $LOOP_DEV
-          
-          # 格式化分区
-          sudo mkfs.ext4 -F ${LOOP_DEV}p1
-          
-          # 挂载分区
-          MOUNT_DIR=$(mktemp -d)
-          sudo mount ${LOOP_DEV}p1 $MOUNT_DIR
-          
-          # 解压 rootfs
-          sudo tar -xzf build/rootfs.tar.gz -C $MOUNT_DIR
-          
-          # 卸载
-          sudo umount $MOUNT_DIR
-          sudo losetup -d $LOOP_DEV
-          rmdir $MOUNT_DIR
-          
-          echo "基础镜像创建完成"
-        fi
-        
-        # 压缩镜像
-        cd output
-        for img in *.img; do
-          if [ -f "$img" ]; then
-            echo "压缩 $img ..."
-            gzip -k "$img"
-          fi
-        done
-        
-        echo "FIRMWARE_PATH=$PACK_WORKSPACE/output" >> $GITHUB_ENV
-        echo "status=success" >> $GITHUB_OUTPUT
-        
-        echo "===== 打包完成 ====="
-        ls -lh $PACK_WORKSPACE/output/
+        echo "===== 最终固件 ====="
+        ls -lh $GITHUB_WORKSPACE/output/
 
-    - name: 上传 rootfs（备用）
+    - name: 上传 rootfs（备份）
       uses: actions/upload-artifact@v4
       if: steps.compile.outputs.status == 'success'
       with:
-        name: ImmortalWrt_OneCloud_Rootfs_${{ env.FILE_DATE }}
-        path: ${{ env.OPENWRT_PATH }}/bin/targets/*/*/immortalwrt-*-rootfs.tar.gz
+        name: ImmortalWrt_Rootfs_${{ env.FILE_DATE }}
+        path: ${{ env.ROOTFS_PATH }}
 
     - name: 上传打包固件
       uses: actions/upload-artifact@v4
@@ -229,64 +204,139 @@ jobs:
       if: env.UPLOAD_RELEASE == 'true' && steps.package.outputs.status == 'success'
       run: |
         echo "release_tag=$(date +"%Y.%m.%d-%H%M")" >> $GITHUB_OUTPUT
+        
         cat > release.txt <<EOF
-        ## ImmortalWrt OneCloud (S805) 固件
+        ## 🎉 ImmortalWrt OneCloud 固件
         
-        ### 📦 编译信息
-        - 编译时间: $(date +"%Y年%m月%d日 %H:%M:%S")
-        - 目标设备: OneCloud (Amlogic S805)
-        - 基于: ImmortalWrt $REPO_BRANCH 分支
-        - U-Boot: soulteary/onecloud-u-boot
+        ### 📋 固件信息
+        - **构建时间**: $(date +"%Y年%m月%d日 %H:%M:%S")
+        - **目标设备**: 玩客云 OneCloud (Amlogic S805)
+        - **系统版本**: ImmortalWrt $REPO_BRANCH
+        - **U-Boot**: soulteary/onecloud-u-boot (2025.01.06)
+        - **固件类型**: 完整刷机包（.img）
         
-        ### 📝 固件说明
-        此固件经过完整的编译和打包流程，包含：
-        - ✅ OneCloud 专用 u-boot
-        - ✅ ImmortalWrt 系统（精简版）
-        - ✅ 中文界面
-        - ✅ 基础网络功能
+        ### ✨ 固件特性
+        - ✅ 基于 ImmortalWrt 最新源码编译
+        - ✅ 精简系统，运行流畅
+        - ✅ 中文界面，使用友好
+        - ✅ 包含 LuCI Web 管理界面
+        - ✅ 支持 USB 存储设备
+        - ✅ 千兆有线网络
         
         ### 🚀 刷机方法
         
-        **方法 1: 系统内升级（推荐）**
+        #### 方法一：系统内升级（推荐）⭐
+        如果你的 OneCloud 已经运行 OpenWrt/Armbian 等 Linux 系统：
+        
         \`\`\`bash
         # SSH 登录到 OneCloud
-        ssh root@你的IP
+        ssh root@你的IP地址
         
-        # 下载固件
+        # 下载固件（替换下面的 URL）
         cd /tmp
-        wget https://github.com/你的用户名/仓库/releases/download/${{ steps.tag.outputs.release_tag }}/固件文件名.img.gz
+        wget https://github.com/你的用户名/仓库/releases/download/${{ steps.tag.outputs.release_tag }}/${{ env.FIRMWARE_NAME }}.gz
         
         # 解压
-        gunzip *.img.gz
+        gunzip ${{ env.FIRMWARE_NAME }}.gz
         
-        # 刷入（⚠️ 会清空数据）
-        dd if=*.img of=/dev/mmcblk0 bs=4M conv=fsync status=progress
+        # 刷入固件（⚠️ 注意：会清空所有数据！）
+        dd if=${{ env.FIRMWARE_NAME }} of=/dev/mmcblk0 bs=4M conv=fsync status=progress
         
         # 重启
         reboot
         \`\`\`
         
-        **方法 2: USB 刷机**
-        1. 使用 USB 双公头线连接 OneCloud 和电脑
-        2. 按住 Reset 孔插电进入刷机模式
-        3. 使用 USB Burning Tool 刷入固件
+        #### 方法二：USB 线刷（全新安装）
         
-        ### ⚙️ 默认设置
-        - IP 地址: \`192.168.1.1\` 或 DHCP 自动获取
-        - 用户名: \`root\`
-        - 密码: \`password\`（或无密码）
+        **准备工具：**
+        - USB 双公头数据线
+        - [Amlogic USB Burning Tool v2.1.6.8](https://www.amlogic.cn/)
+        - 镊子或金属导线（用于短接）
         
-        ### ⚠️ 注意事项
-        - 刷机前请备份重要数据
-        - 首次启动可能需要 2-3 分钟
-        - 建议首次登录后修改密码
-        - 如需扩容，登录后执行磁盘扩容操作
+        **刷机步骤：**
+        1. 拆开 OneCloud 外壳，找到主板
+        2. 找到短接点（不同版本位置可能不同，请搜索"玩客云短接点"）
+        3. USB 线连接 OneCloud（靠近 HDMI 的 USB 口）和电脑
+        4. 打开 USB Burning Tool，导入下载的 \`.img\` 文件
+        5. 用镊子短接触点，然后插电，看到"已连接"后松开
+        6. 点击"开始"按钮，等待刷写完成（约 5-6 分钟）
+        7. 刷写成功后断电，装回外壳
+        
+        ### ⚙️ 首次使用
+        
+        1. **连接设备**
+           - 用网线连接 OneCloud 和路由器
+           - 插电启动，等待 2-3 分钟
+        
+        2. **查找 IP 地址**
+           - 方法 1：登录路由器后台，查看名为 "onecloud" 的设备
+           - 方法 2：默认可能是 \`192.168.1.1\`
+        
+        3. **登录管理界面**
+           - 浏览器访问：\`http://你的IP地址\`
+           - 默认用户名：\`root\`
+           - 默认密码：\`password\` 或无密码
+        
+        4. **首次配置**
+           - 修改管理密码
+           - 配置网络（WAN/LAN）
+           - 根据需要安装额外软件包
         
         ### 📂 文件说明
-        - \`.img.gz\`: 压缩的固件镜像（推荐下载）
-        - \`.img\`: 未压缩的固件镜像
-        - \`rootfs.tar.gz\`: 根文件系统（供高级用户使用）
+        
+        - **${{ env.FIRMWARE_NAME }}.gz** - 压缩的固件镜像（推荐下载，体积小）
+        - **${{ env.FIRMWARE_NAME }}** - 未压缩的固件镜像
+        - **rootfs.tar.gz** - 根文件系统（供高级用户自行打包使用）
+        
+        ### ⚠️ 重要提醒
+        
+        - 刷机前请**务必备份**重要数据和配置
+        - 首次启动可能需要 2-3 分钟，请耐心等待
+        - 如遇问题，可尝试重新刷机或使用 USB 线刷方式
+        - 建议首次登录后立即修改密码
+        
+        ### 🔧 故障排查
+        
+        **无法访问管理界面？**
+        - 检查网线连接
+        - 查看路由器 DHCP 列表确认 IP
+        - 等待足够的启动时间（2-3分钟）
+        - 尝试访问 192.168.1.1
+        
+        **刷机失败？**
+        - 确认使用 USB Burning Tool v2.1.6.8
+        - 检查短接是否到位
+        - 更换 USB 线或电脑 USB 口
+        - 确保下载的固件完整（检查 SHA256）
+        
+        ### 💡 进阶使用
+        
+        **磁盘扩容（如需使用全部 eMMC 空间）：**
+        \`\`\`bash
+        ssh root@你的IP
+        /usr/sbin/parted /dev/mmcblk0 resizepart 2 100%
+        resize2fs /dev/mmcblk0p2
+        \`\`\`
+        
+        **挂载 USB 存储：**
+        \`\`\`bash
+        # 查看设备
+        fdisk -l
+        
+        # 挂载
+        mkdir -p /mnt/usb
+        mount /dev/sda1 /mnt/usb
+        \`\`\`
+        
+        ### 📞 反馈与支持
+        
+        如遇问题或有建议，欢迎在 Issues 中反馈！
+        
+        ---
+        
+        **感谢使用！如果觉得有用，请给个 ⭐ Star！**
         EOF
+        
         echo "status=success" >> $GITHUB_OUTPUT
 
     - name: 上传到 Release
@@ -299,13 +349,22 @@ jobs:
         body_path: release.txt
         files: |
           ${{ env.FIRMWARE_PATH }}/*
-          ${{ env.OPENWRT_PATH }}/bin/targets/*/*/immortalwrt-*-rootfs.tar.gz
+          ${{ env.ROOTFS_PATH }}
+
+    - name: 清理旧的 Releases
+      uses: dev-drprasad/delete-older-releases@v0.3.4
+      if: env.UPLOAD_RELEASE == 'true' && steps.tag.outputs.status == 'success'
+      with:
+        keep_latest: 5
+        delete_tags: true
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
     - name: 上传编译日志（失败时）
       uses: actions/upload-artifact@v4
       if: failure()
       with:
-        name: Build_Error_Log_${{ env.FILE_DATE }}
+        name: Build_Logs_${{ env.FILE_DATE }}
         path: |
           ${{ env.OPENWRT_PATH }}/build.log
           ${{ env.OPENWRT_PATH }}/.config
